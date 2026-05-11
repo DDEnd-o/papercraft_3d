@@ -1,0 +1,7 @@
+trimesh>=4.0.0 # Dùng cho tính toán mesh 3D
+numpy>=1.24.0 # Dùng cho tính toán số học và xử lý mảng
+scipy>=1.11.0 # Dùng cho tính toán mesh
+Pillow>=10.0.0 # Dùng cho xử lý ảnh thumbnail và watermark
+reportlab>=4.0.0 # Dùng để export ra file PDF
+PyQt5>=5.15.0 # Dùng để tạo giao diện đồ họa (GUI)
+fast-simplification>=0.1.6 # Dùng để giảm số lượng đa giác (faces) của mesh
