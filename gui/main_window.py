@@ -36,7 +36,7 @@ QGroupBox {
     border: 1px solid #2A2A40;
     border-radius: 8px;
     margin-top: 12px;
-    padding: 8px;
+    padding: 20px 8px 8px 8px;
     font-weight: bold;
     color: #9090B0;
     font-size: 11px;
@@ -55,20 +55,10 @@ QPushButton {
 QPushButton:hover { background: #2A2A45; border-color: #F5C518; }
 QPushButton:pressed { background: #F5C518; color: #000; }
 QPushButton:disabled { color: #555; border-color: #222; }
-QPushButton#btn_run {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #F5C518,stop:1 #E8B800);
-    color: #0F0F1A; font-weight: bold; font-size: 14px;
-    border: none; border-radius: 8px; padding: 12px;
-}
-QPushButton#btn_run:hover { background: #FFD700; }
-QPushButton#btn_pdf {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #1565C0,stop:1 #0D47A1);
-    color: white; font-weight: bold; border: none; border-radius: 8px;
-}
-QPushButton#btn_pdf:hover { background: #1976D2; }
 QComboBox {
     background: #1E1E30; border: 1px solid #3A3A55;
     border-radius: 6px; padding: 6px 10px; color: #E8E8F0;
+    min-height: 28px;
 }
 QComboBox::drop-down { border: none; width: 24px; }
 QComboBox QAbstractItemView {
@@ -86,6 +76,7 @@ QSlider::sub-page:horizontal { background: #F5C518; border-radius: 2px; }
 QSpinBox, QDoubleSpinBox {
     background: #1E1E30; border: 1px solid #3A3A55;
     border-radius: 6px; padding: 5px 8px; color: #E8E8F0;
+    min-height: 28px;
 }
 QProgressBar {
     background: #1E1E30; border: 1px solid #2A2A40;
@@ -178,7 +169,7 @@ class PipelineWorker(QThread):
             layout_r = layout_panels(
                 unfold_r.panels,
                 target_size_mm=self.target_size_mm,
-                adj_pairs=mesh_r.mesh.face_adjacency,
+                mesh=mesh_r.mesh,
             )
             self.progress_sig.emit(
                 f"Layout xong: {len(layout_r.pages)} trang", 100)
@@ -401,8 +392,14 @@ class MainWindow(QMainWindow):
 
         # ── Run button ────────────────────────────────────────────────────
         self.btn_run = QPushButton("▶  Tạo Papercraft")
-        self.btn_run.setObjectName("btn_run")
         self.btn_run.setFixedHeight(44)
+        self.btn_run.setStyleSheet("""
+            QPushButton {
+                background-color: #F5C518; color: #0F0F1A; font-weight: bold; font-size: 14px; border-radius: 8px; border: none;
+            }
+            QPushButton:hover { background-color: #FFD700; }
+            QPushButton:disabled { background-color: #3A3A55; color: #8888AA; }
+        """)
         self.btn_run.clicked.connect(self._run_pipeline)
         sb_layout.addWidget(self.btn_run)
 
@@ -415,7 +412,14 @@ class MainWindow(QMainWindow):
         grp_exp = QGroupBox("Xuất File")
         grp_exp_l = QVBoxLayout(grp_exp)
         self.btn_pdf = QPushButton("⬇  Xuất PDF")
-        self.btn_pdf.setObjectName("btn_pdf")
+        self.btn_pdf.setFixedHeight(44)
+        self.btn_pdf.setStyleSheet("""
+            QPushButton {
+                background-color: #1565C0; color: white; font-weight: bold; font-size: 14px; border-radius: 8px; border: none;
+            }
+            QPushButton:hover { background-color: #1976D2; }
+            QPushButton:disabled { background-color: #1E1E30; color: #555577; }
+        """)
         self.btn_pdf.setEnabled(False)
         self.btn_pdf.clicked.connect(self._export_pdf)
         grp_exp_l.addWidget(self.btn_pdf)
@@ -446,7 +450,13 @@ class MainWindow(QMainWindow):
         self.preview = PapercraftView()
         self.tabs.addTab(self.preview, "📄 Papercraft Preview")
 
-        # Tab 2: Info
+        # Tab 2: Từ ảnh (Nhánh 1)
+        from gui.depth_panel import DepthPanel
+        self.depth_panel = DepthPanel()
+        self.depth_panel.layout_ready.connect(self._on_depth_layout_ready)
+        self.tabs.addTab(self.depth_panel, "📷 Từ Ảnh (AI)")
+
+        # Tab 3: Info
         self.info_widget = QTextEdit()
         self.info_widget.setReadOnly(True)
         self.info_widget.setPlaceholderText("Thông tin mesh và kết quả sẽ hiển thị ở đây...")
@@ -598,3 +608,13 @@ class MainWindow(QMainWindow):
                                     f"PDF đã lưu tại:\n{path}")
         else:
             self._log("❌ Xuất PDF thất bại!", "#E74C3C")
+
+    def _on_depth_layout_ready(self, layout_r, depth_r):
+        """Nhận kết quả từ DepthPanel → hiện preview + mở khóa export."""
+        self.layout_r = layout_r
+        self.mesh_r   = depth_r
+        self.preview.set_layout(layout_r, page=0)
+        self._update_page_nav()
+        self.btn_pdf.setEnabled(True)
+        self.tabs.setCurrentIndex(0)
+        self._log("Depth → Papercraft xong! Xem preview và xuat PDF.", "#4ECB71")
