@@ -597,9 +597,10 @@ class MainWindow(QMainWindow):
 
         from modules.pdf_exporter import export_pdf
         self._log("Đang xuất PDF...", "#F5C518")
+        title_suffix = getattr(self.mesh_r, 'source_name', 'Từ Ảnh') if self.mesh_r else ''
         ok = export_pdf(
             self.layout_r, path,
-            title=f"Papercraft 3D — {self.mesh_r.source_name if self.mesh_r else ''}",
+            title=f"Papercraft 3D — {title_suffix}",
             show_glue=self.chk_glue.isChecked(),
         )
         if ok:

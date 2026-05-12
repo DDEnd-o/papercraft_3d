@@ -176,7 +176,7 @@ def _depth_to_mesh(depth_np: np.ndarray,
                    color_img: "Image",
                    depth_scale: float = 3.0,
                    remove_background: bool = True,
-                   target_faces: int = 200) -> "trimesh.Trimesh":
+                   target_faces: int = 200) -> object:
     """
     Chuyển depth map 2D → mesh 3D bằng cách tạo lưới điểm 3D.
 
