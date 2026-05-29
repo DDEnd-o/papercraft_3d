@@ -21,12 +21,6 @@ try:
 except ImportError:
     PIL_OK = False
 
-try:
-    import cv2
-    CV2_OK = True
-except ImportError:
-    CV2_OK = False
-
 
 # ── Model options theo GPU/CPU ────────────────────────────────────────────────
 # Small  : ~100MB  - CPU chạy được (~5-10s)
@@ -63,6 +57,8 @@ def estimate_depth_and_build_mesh(
     target_faces: int = 200,
     depth_scale: float = 3.0,
     remove_background: bool = True,
+    solidify: bool = True,
+    back_depth_np: Optional[np.ndarray] = None,
     on_progress: Optional[Callable] = None,
 ) -> DepthResult:
     """
@@ -74,6 +70,9 @@ def estimate_depth_and_build_mesh(
         target_faces     : số faces mesh output
         depth_scale      : độ sâu tương đối (càng lớn mesh càng dày)
         remove_background: loại bỏ vùng nền phẳng
+        solidify         : (v1.3) đóng mặt sau + side walls → mesh watertight
+        back_depth_np    : (v1.4) depth map mặt sau đã align (cùng (H, W), cùng hệ XY)
+                           với front depth. Nếu None → fallback v1.3 (back phẳng).
         on_progress      : callback(msg, pct)
 
     Returns:
@@ -150,12 +149,29 @@ def estimate_depth_and_build_mesh(
 
         # ── Bước 3: Depth Map → Point Cloud ──────────────────────────────
         prog("Chuyển depth map → point cloud...", 68)
+
+        # v1.4: nếu back_depth_np không khớp shape với depth_np đã resize,
+        # interpolate về shape của depth_np.
+        back_for_mesh = back_depth_np
+        if back_for_mesh is not None and back_for_mesh.shape != depth_np.shape:
+            try:
+                from PIL import Image as _PILImg
+                back_img = _PILImg.fromarray(
+                    (np.clip(back_for_mesh, 0.0, 1.0) * 255).astype(np.uint8),
+                    mode="L",
+                ).resize((depth_np.shape[1], depth_np.shape[0]), _PILImg.LANCZOS)
+                back_for_mesh = np.array(back_img).astype(float) / 255.0
+            except Exception:
+                back_for_mesh = None
+
         mesh = _depth_to_mesh(
             depth_np,
             orig_resized,
             depth_scale=depth_scale,
             remove_background=remove_background,
             target_faces=target_faces,
+            solidify=solidify,
+            back_depth_np=back_for_mesh,
         )
         prog("Point cloud → Mesh xong!", 90)
 
@@ -176,12 +192,24 @@ def _depth_to_mesh(depth_np: np.ndarray,
                    color_img: "Image",
                    depth_scale: float = 3.0,
                    remove_background: bool = True,
-                   target_faces: int = 200) -> object:
+                   target_faces: int = 200,
+                   solidify: bool = True,
+                   back_depth_np: Optional[np.ndarray] = None) -> object:
     """
-    Chuyển depth map 2D → mesh 3D bằng cách tạo lưới điểm 3D.
+    Chuyển depth map 2D → mesh 3D.
 
-    Mỗi pixel (x, y) với depth d → điểm 3D (x_norm, y_norm, d * depth_scale)
-    Sau đó nối thành mesh tam giác (grid triangulation).
+    v1.3 — Solidify:
+        Trước kia chỉ tạo lưới (x, y, z=depth) — mesh hở, dán xong ra "tấm cong"
+        chứ không phải khối 3D. Giờ ta:
+          1. Layer trước  (front) : z = depth_scale * d(x,y)
+          2. Layer sau    (back)  : z = 0 — phẳng (đáy nằm trên giấy lưng)
+          3. Side walls          : viền foreground (mask boundary) nối front↔back
+        ⇒ mesh thành khối kín (watertight) để unfold ra papercraft thật.
+
+    v1.4 — Back depth từ AI inpainting:
+        Nếu truyền `back_depth_np` (đã align về cùng (H,W) và cùng hệ toạ độ XY
+        với depth_np), back layer dùng z = -back_depth_np * depth_scale,
+        cho ra khối 3D có khối lượng thật ở cả 2 mặt (không còn phẳng tịt).
     """
     import trimesh
     import numpy as np
@@ -189,66 +217,137 @@ def _depth_to_mesh(depth_np: np.ndarray,
     H, W = depth_np.shape
 
     # Downsample để giảm số điểm
-    step = max(1, min(H, W) // 80)   # tối đa ~80×80 grid
+    step = max(1, min(H, W) // 80)
     rows = np.arange(0, H, step)
     cols = np.arange(0, W, step)
     nr, nc = len(rows), len(cols)
 
-    # Tạo lưới tọa độ 3D
     rr, cc = np.meshgrid(rows, cols, indexing='ij')
-    xs = cc / W * 10.0 - 5.0                       # [-5, 5]
-    ys = -(rr / H * 10.0 - 5.0)                    # [-5, 5] lật trục Y
-    zs = depth_np[rr, cc] * depth_scale             # [0, depth_scale]
+    xs = cc / W * 10.0 - 5.0
+    ys = -(rr / H * 10.0 - 5.0)
+    zs = depth_np[rr, cc] * depth_scale
 
-    # Loại background (depth gần 0 = rất xa = background)
     if remove_background:
         bg_threshold = 0.08
         mask = depth_np[rr, cc] > bg_threshold
     else:
         mask = np.ones((nr, nc), dtype=bool)
 
-    # Tạo vertices
-    vertices = np.stack([xs, ys, zs], axis=-1).reshape(-1, 3)
+    # ── Front layer ──────────────────────────────────────────────────────
+    front_verts = np.stack([xs, ys, zs], axis=-1).reshape(-1, 3)
+    front_idx   = np.arange(nr * nc).reshape(nr, nc)
 
-    # Tạo faces (2 tam giác mỗi ô vuông)
-    faces = []
-    idx = np.arange(nr * nc).reshape(nr, nc)
-
+    front_faces = []
     for i in range(nr - 1):
         for j in range(nc - 1):
-            # Bỏ qua ô nếu bất kỳ đỉnh nào là background
-            if not (mask[i,j] and mask[i+1,j] and
-                    mask[i,j+1] and mask[i+1,j+1]):
+            if not (mask[i, j] and mask[i+1, j] and
+                    mask[i, j+1] and mask[i+1, j+1]):
                 continue
-            a = idx[i,   j]
-            b = idx[i+1, j]
-            c = idx[i,   j+1]
-            d = idx[i+1, j+1]
-            faces.append([a, b, c])
-            faces.append([b, d, c])
+            a = front_idx[i,   j]
+            b = front_idx[i+1, j]
+            c = front_idx[i,   j+1]
+            d = front_idx[i+1, j+1]
+            front_faces.append([a, b, c])
+            front_faces.append([b, d, c])
 
-    if not faces:
-        # Fallback: không remove background
+    # Fallback: không remove background nếu sạch không còn face
+    if not front_faces:
+        mask = np.ones((nr, nc), dtype=bool)
         for i in range(nr - 1):
             for j in range(nc - 1):
-                a = idx[i,   j];   b = idx[i+1, j]
-                c = idx[i,   j+1]; d = idx[i+1, j+1]
-                faces.append([a, b, c])
-                faces.append([b, d, c])
+                a = front_idx[i,   j];   b = front_idx[i+1, j]
+                c = front_idx[i,   j+1]; d = front_idx[i+1, j+1]
+                front_faces.append([a, b, c])
+                front_faces.append([b, d, c])
 
-    faces    = np.array(faces, dtype=np.int32)
-    mesh     = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+    front_faces = np.array(front_faces, dtype=np.int32)
 
-    # Gán màu từ ảnh gốc
+    if not solidify:
+        mesh = trimesh.Trimesh(vertices=front_verts, faces=front_faces, process=True)
+    else:
+        # ── Back layer ────────────────────────────────────────────────────
+        # v1.4: nếu có back_depth_np → back có khối nhô ra phía -z (depth nghịch).
+        # Không có → fallback v1.3: phẳng z=0.
+        if back_depth_np is not None and back_depth_np.shape == depth_np.shape:
+            zs_back = -back_depth_np[rr, cc] * depth_scale
+        else:
+            zs_back = np.zeros_like(zs)
+        back_verts  = np.stack([xs, ys, zs_back], axis=-1).reshape(-1, 3)
+        back_offset = len(front_verts)
+
+        # Back faces: winding ngược để normal hướng ra ngoài (về -z)
+        back_faces = []
+        for i in range(nr - 1):
+            for j in range(nc - 1):
+                if not (mask[i, j] and mask[i+1, j] and
+                        mask[i, j+1] and mask[i+1, j+1]):
+                    continue
+                a = front_idx[i,   j]   + back_offset
+                b = front_idx[i+1, j]   + back_offset
+                c = front_idx[i,   j+1] + back_offset
+                d = front_idx[i+1, j+1] + back_offset
+                back_faces.append([a, c, b])
+                back_faces.append([b, c, d])
+        back_faces = np.array(back_faces, dtype=np.int32)
+
+        # ── Side walls: dò boundary edges của front mesh ─────────────────
+        # Cạnh chỉ thuộc đúng 1 tam giác = nằm trên silhouette → cần wall đi xuống back.
+        # Lưu cạnh có hướng để giữ winding cho normal hướng ra ngoài.
+        from collections import defaultdict
+        edge_count = defaultdict(int)
+        edge_dir = {}
+        for f in front_faces:
+            for k in range(3):
+                a, b = int(f[k]), int(f[(k+1) % 3])
+                key = (min(a, b), max(a, b))
+                edge_count[key] += 1
+                # Lưu hướng đầu tiên gặp; khi count=1 thì hướng này là CCW của face
+                if key not in edge_dir:
+                    edge_dir[key] = (a, b)
+
+        side_faces = []
+        for key, count in edge_count.items():
+            if count != 1:
+                continue
+            a, b = edge_dir[key]  # boundary CCW từ front
+            ab = a + back_offset
+            bb = b + back_offset
+            # Quad (a, b, bb, ab) — wall đi xuống mặt back, winding sao cho normal ra ngoài
+            side_faces.append([a, b, bb])
+            side_faces.append([a, bb, ab])
+
+        if side_faces:
+            side_faces = np.array(side_faces, dtype=np.int32)
+            all_verts = np.vstack([front_verts, back_verts])
+            all_faces = np.vstack([front_faces, back_faces, side_faces])
+        else:
+            all_verts = np.vstack([front_verts, back_verts])
+            all_faces = np.vstack([front_faces, back_faces])
+
+        mesh = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=True)
+        # process=True đã merge duplicate verts; thêm fix_normals để wall xoay đúng chiều
+        try:
+            mesh.fix_normals()
+        except Exception:
+            pass
+
+    # Gán màu từ ảnh gốc (chỉ áp dụng cho front layer)
     try:
         color_arr = np.array(color_img.resize((W, H), Image.LANCZOS))
         colors_flat = color_arr[rr, cc].reshape(-1, 3)
-        alpha = np.full((len(colors_flat), 1), 255, dtype=np.uint8)
-        vertex_colors = np.hstack([colors_flat, alpha])
-        mesh.visual = trimesh.visual.ColorVisuals(
-            mesh=mesh, vertex_colors=vertex_colors)
+        if solidify:
+            colors_back = (colors_flat * 0.5).astype(np.uint8)
+            colors_all  = np.vstack([colors_flat, colors_back])
+        else:
+            colors_all = colors_flat
+        alpha = np.full((len(colors_all), 1), 255, dtype=np.uint8)
+        vertex_colors = np.hstack([colors_all, alpha])
+        # Mesh sau process có thể đã đổi số verts; chỉ gán nếu khớp
+        if len(vertex_colors) == len(mesh.vertices):
+            mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=mesh, vertex_colors=vertex_colors)
     except Exception:
-        pass  # Không có màu cũng không sao
+        pass
 
     # Simplify
     if len(mesh.faces) > target_faces:
@@ -260,6 +359,40 @@ def _depth_to_mesh(depth_np: np.ndarray,
 
     mesh.merge_vertices()
     return mesh
+
+
+def estimate_depth_only(pil_img: "Image", model_size: str = "small") -> np.ndarray:
+    """v1.4 helper — chạy depth-anything trên 1 PIL.Image, trả depth_np normalize 0-1.
+
+    Khác `estimate_depth_and_build_mesh` ở chỗ: không cần file path, không build mesh,
+    dùng cho ảnh back-view do SD sinh ra trong RAM.
+    """
+    from transformers import pipeline as hf_pipeline
+    import torch
+
+    device  = "cuda" if torch.cuda.is_available() else "cpu"
+    model_id = DEPTH_MODELS.get(model_size, DEPTH_MODELS["small"])
+    pipe = hf_pipeline(
+        task="depth-estimation",
+        model=model_id,
+        device=0 if device == "cuda" else -1,
+    )
+
+    max_dim = 518
+    w, h = pil_img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img_resized = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    else:
+        img_resized = pil_img
+
+    out = pipe(img_resized.convert("RGB"))
+    depth_pil = out["depth"]
+    depth_np  = np.array(depth_pil).astype(float)
+    dmin, dmax = depth_np.min(), depth_np.max()
+    if dmax - dmin > 1e-6:
+        depth_np = (depth_np - dmin) / (dmax - dmin)
+    return depth_np
 
 
 def save_depth_visualization(depth_result: DepthResult,

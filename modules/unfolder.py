@@ -1,30 +1,48 @@
 """
 modules/unfolder.py
-Thuật toán trải phẳng mesh 3D → các panel 2D dùng Spanning Tree BFS.
+Thuật toán trải phẳng mesh 3D → các panel 2D dùng MST trên facet n-gon.
 
-Cách hoạt động:
-1. Xây dựng spanning tree từ đồ thị liền kề mặt
-2. BFS từ face gốc, lần lượt xoay từng mặt ra mặt phẳng 2D
-3. Mỗi face con được xoay theo shared edge với face cha
-4. Kết quả: list Panel2D chứa tọa độ 2D của từng tam giác
+v1.2 — Gộp đồng phẳng trước khi unfold:
+  - Các tam giác cùng mặt phẳng (góc < 3°) được gộp thành 1 facet đa giác.
+  - Cube 12 triangles → 6 facet vuông; cylinder thân → các quad dọc.
+  - MST chạy trên đồ thị facet (ít node hơn, ít cạnh "ảo" đè lên).
+
+Pipeline:
+  1. _extract_facets()       : union-find theo cạnh đồng phẳng → polygon outline
+  2. _build_facet_adjacency(): map facet ↔ facet qua các cạnh không đồng phẳng
+  3. _unfold_facets_island() : MST/BFS xoay từng facet vào mặt phẳng 2D
 """
 import numpy as np
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Tuple, Dict
+import heapq
 import trimesh
 from shapely.geometry import Polygon
 
 
+# ── Data classes ──────────────────────────────────────────────────────────────
+
 @dataclass
 class Panel2D:
-    """Một mảnh papercraft — tam giác được trải phẳng ra 2D."""
-    face_idx:   int                          # index trong mesh gốc
-    verts_2d:   np.ndarray                   # shape (3,2) tọa độ 2D
-    color:      tuple = (220, 200, 160)      # màu fill (R,G,B)
-    group_id:   int   = 0                    # nhóm liên kết (island)
-    neighbors:  list  = field(default_factory=list)  # [(face_idx, edge_verts)]
-    fold_edges: set   = field(default_factory=set)   # local edge indices (0,1,2) that are folded
+    """Một mảnh papercraft — facet đa giác đã được trải phẳng ra 2D.
+
+    Sau v1.2, panel có thể là tam giác (n=3) hoặc đa giác bất kỳ (n≥3) tuỳ
+    việc gộp các face đồng phẳng.
+    """
+    face_idx:     int                          # face đại diện (dùng cho label/màu)
+    verts_2d:     np.ndarray                   # shape (n, 2) — n đỉnh polygon outline
+    color:        tuple = (220, 200, 160)
+    group_id:     int   = 0                    # island id
+    fold_edges:   set   = field(default_factory=set)  # local edge idx (MST edges)
+    # ── Mới ở v1.2 ────────────────────────────────────────────────────────
+    outline_vidx: list  = field(default_factory=list) # global vertex idx cho từng đỉnh outline
+    face_indices: list  = field(default_factory=list) # tất cả mesh face idx thuộc facet này
+    normal:       Optional[np.ndarray] = None         # facet normal (3,)
+
+    @property
+    def n(self) -> int:
+        return len(self.verts_2d)
 
     @property
     def centroid(self):
@@ -38,79 +56,82 @@ class Panel2D:
 
     @property
     def area(self):
-        v = self.verts_2d
-        return abs((v[1,0]-v[0,0])*(v[2,1]-v[0,1]) -
-                   (v[2,0]-v[0,0])*(v[1,1]-v[0,1])) * 0.5
+        x = self.verts_2d[:, 0]
+        y = self.verts_2d[:, 1]
+        return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
 
 
 @dataclass
 class UnfoldResult:
-    panels:     list          # list[Panel2D]
-    success:    bool = True
-    error:      str  = ""
-    num_islands: int = 0      # số vùng rời nhau
+    panels:      list           # list[Panel2D]
+    success:     bool = True
+    error:       str  = ""
+    num_islands: int  = 0
+    num_facets:  int  = 0       # tổng số facet đã sinh ra (bao gồm cả những facet bị skip do overlap)
 
     def summary(self):
         return (f"  Panels    : {len(self.panels)}\n"
+                f"  Facets    : {self.num_facets}\n"
                 f"  Islands   : {self.num_islands}\n"
                 f"  Success   : {self.success}")
 
 
-def _get_edge_index(face_verts, v0, v1):
-    for i in range(3):
-        a = face_verts[i]
-        b = face_verts[(i+1)%3]
-        if (a == v0 and b == v1) or (a == v1 and b == v0):
-            return i
-    return -1
+# ── 2D geometry helpers ───────────────────────────────────────────────────────
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _project_polygon_to_2d(verts_3d: np.ndarray, normal: np.ndarray) -> np.ndarray:
+    """Chiếu polygon phẳng (n đỉnh, 3D) xuống hệ tọa độ 2D cục bộ.
 
-def _tri_to_2d(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-    """Chiếu tam giác 3D xuống hệ tọa độ 2D cục bộ."""
-    e1 = v1 - v0
-    e2 = v2 - v0
+    Trục x = cạnh đầu tiên; trục y = perpendicular trong mặt phẳng (theo normal).
+    """
+    n_verts = len(verts_3d)
+    if n_verts < 3:
+        return np.zeros((n_verts, 2))
+
+    origin = verts_3d[0]
+    e1 = verts_3d[1] - origin
     len_e1 = np.linalg.norm(e1)
     if len_e1 < 1e-10:
-        return np.zeros((3, 2))
+        return np.zeros((n_verts, 2))
     x_axis = e1 / len_e1
-    normal = np.cross(e1, e2)
-    y_axis = np.cross(normal, e1)
+
+    y_axis = np.cross(normal, x_axis)
     len_y = np.linalg.norm(y_axis)
     if len_y < 1e-10:
-        return np.zeros((3, 2))
-    y_axis /= len_y
-    return np.array([
-        [0.0,                   0.0],
-        [np.dot(e1, x_axis),    0.0],
-        [np.dot(e2, x_axis),    np.dot(e2, y_axis)],
-    ])
+        # Normal có thể bị suy biến → tự tính lại từ verts
+        for k in range(2, n_verts):
+            ek = verts_3d[k] - origin
+            n_alt = np.cross(e1, ek)
+            ln = np.linalg.norm(n_alt)
+            if ln > 1e-10:
+                n_alt = n_alt / ln
+                y_axis = np.cross(n_alt, x_axis)
+                len_y = np.linalg.norm(y_axis)
+                if len_y > 1e-10:
+                    break
+        if len_y < 1e-10:
+            return np.zeros((n_verts, 2))
+    y_axis = y_axis / len_y
+
+    out = np.zeros((n_verts, 2))
+    for i in range(n_verts):
+        rel = verts_3d[i] - origin
+        out[i, 0] = float(np.dot(rel, x_axis))
+        out[i, 1] = float(np.dot(rel, y_axis))
+    return out
 
 
 def _build_transform(src_a: np.ndarray, src_b: np.ndarray,
-                     dst_a: np.ndarray, dst_b: np.ndarray) -> np.ndarray:
-    """
-    Tính ma trận affine 3×3 (rotation+translation trong 2D) sao cho:
-      src_a → dst_a,  src_b → dst_b
-    """
-    # Vector hướng
+                     dst_a: np.ndarray, dst_b: np.ndarray):
+    """Ma trận affine 2D (R, t) sao cho src_a→dst_a, src_b→dst_b."""
     s = src_b - src_a
     d = dst_b - dst_a
-    ls = np.linalg.norm(s)
-    ld = np.linalg.norm(d)
-    if ls < 1e-10 or ld < 1e-10:
+    if np.linalg.norm(s) < 1e-10 or np.linalg.norm(d) < 1e-10:
         return np.eye(2), np.zeros(2)
 
-    # Góc xoay
-    angle_s = np.arctan2(s[1], s[0])
-    angle_d = np.arctan2(d[1], d[0])
-    angle   = angle_d - angle_s
-
+    angle = np.arctan2(d[1], d[0]) - np.arctan2(s[1], s[0])
     cos_a, sin_a = np.cos(angle), np.sin(angle)
     R = np.array([[cos_a, -sin_a],
                   [sin_a,  cos_a]])
-
-    # Translation: sau khi xoay, src_a → dst_a
     t = dst_a - R @ src_a
     return R, t
 
@@ -119,21 +140,299 @@ def _apply_transform(pts: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarra
     return (R @ pts.T).T + t
 
 
-# ── Main unfolder ─────────────────────────────────────────────────────────────
+def _angle_between_normals(n1, n2):
+    return float(np.arccos(np.clip(np.dot(n1, n2), -1.0, 1.0)))
+
+
+# ── Facet extraction (gộp đồng phẳng) ─────────────────────────────────────────
+
+def _walk_boundary(directed_edges: List[Tuple[int, int]]) -> List[int]:
+    """Nối các cạnh có hướng thành 1 vòng kín. Trả về list[vertex_idx] CCW."""
+    if not directed_edges:
+        return []
+    nxt: Dict[int, int] = {}
+    for a, b in directed_edges:
+        if a in nxt:
+            # Vertex có >1 cạnh ra → boundary không phải simple loop, bỏ qua
+            return []
+        nxt[a] = b
+
+    start = directed_edges[0][0]
+    loop = [start]
+    cur = start
+    safety = len(directed_edges) + 4
+    for _ in range(safety):
+        nv = nxt.get(cur)
+        if nv is None:
+            return []
+        if nv == start:
+            return loop
+        loop.append(nv)
+        cur = nv
+    return []
+
+
+def _extract_facets(mesh: trimesh.Trimesh, angle_tol_deg: float = 3.0):
+    """Gộp các face đồng phẳng (góc nhị diện < angle_tol_deg) thành facet đa giác.
+
+    Trả về:
+        facets: list[dict] với key: face_indices, outline_vidx, verts_3d, normal
+        face_to_facet: np.ndarray (n_faces,) → facet index
+    """
+    n_faces = len(mesh.faces)
+    if n_faces == 0:
+        return [], np.zeros(0, dtype=int)
+
+    coplanar_tol = float(np.radians(angle_tol_deg))
+
+    # Union-find
+    parent = list(range(n_faces))
+    def find(x):
+        r = x
+        while parent[r] != r:
+            r = parent[r]
+        # Path compression
+        while parent[x] != r:
+            parent[x], x = r, parent[x]
+        return r
+
+    adj         = mesh.face_adjacency
+    adj_angles  = mesh.face_adjacency_angles
+
+    for (a, b), ang in zip(adj, adj_angles):
+        if ang < coplanar_tol:
+            ra, rb = find(int(a)), find(int(b))
+            if ra != rb:
+                parent[ra] = rb
+
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for f in range(n_faces):
+        groups[find(f)].append(f)
+
+    facets = []
+    face_to_facet = np.full(n_faces, -1, dtype=int)
+
+    for root, face_list in groups.items():
+        # Tính normal trung bình theo diện tích
+        normals = mesh.face_normals[face_list]
+        areas   = mesh.area_faces[face_list]
+        n_vec   = (normals * areas[:, None]).sum(axis=0)
+        ln = np.linalg.norm(n_vec)
+        if ln < 1e-10:
+            n_vec = normals[0]
+        else:
+            n_vec = n_vec / ln
+
+        # Tìm boundary outline:
+        #   Mỗi face đóng góp 3 cạnh có hướng (theo winding).
+        #   Cạnh nội bộ xuất hiện ở cả 2 chiều (chia bởi 2 face cùng facet).
+        #   Cạnh boundary xuất hiện duy nhất 1 chiều.
+        edge_owner: Dict[Tuple[int, int], int] = {}
+        edge_count: Dict[Tuple[int, int], int] = defaultdict(int)
+
+        for fi in face_list:
+            verts = mesh.faces[fi]
+            for i in range(3):
+                a = int(verts[i])
+                b = int(verts[(i + 1) % 3])
+                edge_owner[(a, b)] = fi
+                edge_count[(min(a, b), max(a, b))] += 1
+
+        boundary_directed = [
+            (a, b) for (a, b) in edge_owner
+            if edge_count[(min(a, b), max(a, b))] == 1
+        ]
+        outline = _walk_boundary(boundary_directed)
+
+        # Fallback: nếu boundary không phải simple loop, tách từng face làm 1 facet riêng
+        if len(outline) < 3:
+            for fi in face_list:
+                facet_idx = len(facets)
+                fv = mesh.faces[fi]
+                facets.append({
+                    'face_indices': [fi],
+                    'outline_vidx': [int(fv[0]), int(fv[1]), int(fv[2])],
+                    'verts_3d':     mesh.vertices[fv].copy(),
+                    'normal':       mesh.face_normals[fi].copy(),
+                })
+                face_to_facet[fi] = facet_idx
+            continue
+
+        facet_idx = len(facets)
+        for fi in face_list:
+            face_to_facet[fi] = facet_idx
+        facets.append({
+            'face_indices': list(face_list),
+            'outline_vidx': [int(v) for v in outline],
+            'verts_3d':     mesh.vertices[outline].copy(),
+            'normal':       n_vec,
+        })
+
+    return facets, face_to_facet
+
+
+def _build_facet_adjacency(mesh: trimesh.Trimesh, face_to_facet: np.ndarray, facets: list):
+    """Xây đồ thị adjacency giữa các facet.
+
+    Một cặp facet (A, B) được nối nếu có ít nhất 1 cạnh mesh chia 2 face thuộc 2 facet khác nhau.
+    Với facet đã được gộp đồng phẳng, hầu hết các cặp chỉ share đúng 1 cạnh outline.
+    Nếu có nhiều cạnh share (mesh phức tạp), ta chỉ giữ cặp đầu tiên gặp được.
+
+    Trả về:
+        adj[facet_idx] = list[(other_facet, ei_in_self, ei_in_other, (v0_g, v1_g))]
+    """
+    # Bảng tra: (facet_idx, undirected_edge_key) → local edge index trong outline
+    edge_to_local: Dict[Tuple[int, Tuple[int, int]], int] = {}
+    for fi, fac in enumerate(facets):
+        outline = fac['outline_vidx']
+        n = len(outline)
+        for i in range(n):
+            a, b = outline[i], outline[(i + 1) % n]
+            edge_to_local[(fi, (min(a, b), max(a, b)))] = i
+
+    adj: Dict[int, list] = defaultdict(list)
+    pair_seen = set()  # ((fa, fb), edge_key)
+
+    for (fi_a, fi_b), edge_v in zip(mesh.face_adjacency, mesh.face_adjacency_edges):
+        fa = int(face_to_facet[fi_a])
+        fb = int(face_to_facet[fi_b])
+        if fa == fb or fa < 0 or fb < 0:
+            continue
+        v0, v1 = int(edge_v[0]), int(edge_v[1])
+        ek = (min(v0, v1), max(v0, v1))
+        ei_a = edge_to_local.get((fa, ek))
+        ei_b = edge_to_local.get((fb, ek))
+        if ei_a is None or ei_b is None:
+            continue
+        pkey = (min(fa, fb), max(fa, fb), ek)
+        if pkey in pair_seen:
+            continue
+        pair_seen.add(pkey)
+        adj[fa].append((fb, ei_a, ei_b, (v0, v1)))
+        adj[fb].append((fa, ei_b, ei_a, (v0, v1)))
+
+    return adj
+
+
+# ── Unfold MST trên facets ────────────────────────────────────────────────────
+
+def _unfold_facets_island(facets, facet_adj, start_facet, island_id, unvisited):
+    """MST/BFS unfold qua các facet, trả về list[Panel2D]."""
+    panels: Dict[int, Panel2D] = {}
+    placed_polys: List[Polygon] = []
+    visited = set()
+
+    # PQ entry: (cost, current, parent, ei_in_current, ei_in_parent)
+    pq: list = []
+    heapq.heappush(pq, (0.0, start_facet, -1, -1, -1))
+
+    while pq:
+        cost, current, parent, ei_cur, ei_par = heapq.heappop(pq)
+        if current in visited or current not in unvisited:
+            continue
+
+        fac = facets[current]
+        outline = fac['outline_vidx']
+        n_verts = len(outline)
+
+        if parent == -1:
+            v2d = _project_polygon_to_2d(fac['verts_3d'], fac['normal'])
+            panel = Panel2D(
+                face_idx=fac['face_indices'][0],
+                verts_2d=v2d,
+                outline_vidx=list(outline),
+                face_indices=list(fac['face_indices']),
+                normal=np.array(fac['normal'], dtype=float),
+                group_id=island_id,
+            )
+            panels[current] = panel
+            placed_polys.append(Polygon(v2d))
+            visited.add(current)
+        else:
+            parent_panel = panels[parent]
+
+            # 2D điểm đích trên parent cho cạnh chia sẻ
+            n_par = parent_panel.n
+            p2d_start = parent_panel.verts_2d[ei_par]
+            p2d_end   = parent_panel.verts_2d[(ei_par + 1) % n_par]
+
+            # Local 2D của child theo normal của nó (giữ winding gốc 3D)
+            child_local = _project_polygon_to_2d(fac['verts_3d'], fac['normal'])
+            cl_start    = child_local[ei_cur]
+            cl_end      = child_local[(ei_cur + 1) % n_verts]
+
+            # Mesh manifold: cạnh share winding ngược ở child so với parent.
+            # Khớp cl_start → p2d_end và cl_end → p2d_start ⇒ child gập RA NGOÀI parent.
+            R, t = _build_transform(cl_start, cl_end, p2d_end, p2d_start)
+            child_v2d = _apply_transform(child_local, R, t)
+
+            child_poly = Polygon(child_v2d)
+            if not child_poly.is_valid or child_poly.area < 1e-9:
+                continue
+
+            # Overlap check với tất cả poly đã đặt (buffer âm tránh kẹp cạnh chung)
+            check_poly = child_poly.buffer(-1e-4)
+            if check_poly.is_empty:
+                check_poly = child_poly
+
+            cmin = child_v2d.min(axis=0)
+            cmax = child_v2d.max(axis=0)
+            overlap = False
+            for p in placed_polys:
+                minx2, miny2, maxx2, maxy2 = p.bounds
+                if (cmax[0] <= minx2 or cmin[0] >= maxx2 or
+                    cmax[1] <= miny2 or cmin[1] >= maxy2):
+                    continue
+                if check_poly.intersects(p):
+                    overlap = True
+                    break
+            if overlap:
+                # Không unfold được — facet này sẽ trở thành seed của island khác
+                continue
+
+            placed_polys.append(child_poly)
+
+            # Đánh dấu cạnh đã gập (MST edge) ở 2 phía
+            panels[parent].fold_edges.add(ei_par)
+            panel = Panel2D(
+                face_idx=fac['face_indices'][0],
+                verts_2d=child_v2d,
+                outline_vidx=list(outline),
+                face_indices=list(fac['face_indices']),
+                normal=np.array(fac['normal'], dtype=float),
+                group_id=island_id,
+            )
+            panel.fold_edges.add(ei_cur)
+            panels[current] = panel
+            visited.add(current)
+
+        # Enqueue neighbors
+        for (nf, ei_in_self, ei_in_nb, _edge_g) in facet_adj.get(current, []):
+            if nf in visited or nf not in unvisited:
+                continue
+            cost_n = _angle_between_normals(fac['normal'], facets[nf]['normal'])
+            # PQ tie-breaker: include index để tránh so sánh tuple với phần tử không order
+            heapq.heappush(pq, (cost_n, nf, current, ei_in_nb, ei_in_self))
+
+    return list(panels.values())
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def unfold_mesh(mesh: trimesh.Trimesh,
                 max_faces: int = 800,
+                coplanar_tol_deg: float = 3.0,
                 on_progress=None) -> UnfoldResult:
     """
-    Trải phẳng mesh 3D thành các panel 2D bằng BFS spanning tree.
+    Trải phẳng mesh 3D thành các panel 2D.
+
+    v1.2: gộp đồng phẳng trước khi unfold (cube 12 tri → 6 quad).
 
     Args:
-        mesh        : trimesh.Trimesh đã được simplify
-        max_faces   : giới hạn số mặt (tránh quá chậm)
-        on_progress : callback(msg, pct)
-
-    Returns:
-        UnfoldResult chứa list Panel2D
+        mesh             : trimesh.Trimesh
+        max_faces        : giới hạn số mặt (simplify nếu vượt)
+        coplanar_tol_deg : góc nhị diện <= ngưỡng này thì coi 2 face đồng phẳng
+        on_progress      : callback(msg, pct)
     """
     def progress(msg, pct=0):
         print(f"  [{pct:3d}%] {msg}")
@@ -143,13 +442,14 @@ def unfold_mesh(mesh: trimesh.Trimesh,
     result = UnfoldResult(panels=[], success=False)
 
     try:
-        # 0. CHUẨN HOÁ SCALE: Đưa về kích thước tiêu chuẩn để các ngưỡng 1e-5 hoạt động ổn định
+        mesh = mesh.copy()
+
+        # Chuẩn hoá scale để các ngưỡng 1e-5 ổn định
         v_min = mesh.vertices.min(axis=0)
         v_max = mesh.vertices.max(axis=0)
         scale_factor = 100.0 / max((v_max - v_min).max(), 1e-6)
         mesh.vertices = (mesh.vertices - v_min) * scale_factor
 
-        # ── Simplify nếu quá nhiều mặt ────────────────────────────────────
         if len(mesh.faces) > max_faces:
             progress(f"Simplify {len(mesh.faces)} → {max_faces} mặt...", 5)
             mesh = mesh.simplify_quadric_decimation(face_count=max_faces)
@@ -158,33 +458,39 @@ def unfold_mesh(mesh: trimesh.Trimesh,
         n_faces = len(mesh.faces)
         progress(f"Unfold {n_faces} mặt...", 10)
 
-        # ── Xây adjacency list ────────────────────────────────────────────
-        adj       = mesh.face_adjacency          # (E,2) cặp face liền kề
-        adj_edges = mesh.face_adjacency_edges    # (E,2) vertex index cạnh chung
+        # 1. Gộp đồng phẳng
+        facets, face_to_facet = _extract_facets(mesh, coplanar_tol_deg)
+        progress(f"Facets sau gộp đồng phẳng: {len(facets)}", 25)
 
-        neighbors: dict[int, list] = defaultdict(list)
-        for ei, (fi, fj) in enumerate(adj):
-            neighbors[fi].append((int(fj), int(ei)))
-            neighbors[fj].append((int(fi), int(ei)))
+        # 2. Adjacency giữa facets
+        facet_adj = _build_facet_adjacency(mesh, face_to_facet, facets)
 
-        # ── Tìm connected components rồi unfold từng island ───────────────
-        all_panels   = []
-        unvisited    = set(range(n_faces))
-        island_id    = 0
+        # 3. Unfold từng island (connected component trên facet graph)
+        all_panels: List[Panel2D] = []
+        unvisited = set(range(len(facets)))
+        island_id = 0
 
         while unvisited:
             start = next(iter(unvisited))
-            island_panels = _unfold_island(
-                mesh, start, neighbors, adj, adj_edges, island_id, unvisited)
+            island_panels = _unfold_facets_island(
+                facets, facet_adj, start, island_id, unvisited)
             all_panels.extend(island_panels)
             for p in island_panels:
-                unvisited.discard(p.face_idx)
+                # Đánh dấu facet đã unfold — tìm qua facet_idx (face_idx của panel chỉ là đại diện)
+                # Cách an toàn: dùng outline_vidx + face_indices[0] đảo ngược về facet idx
+                fi0 = p.face_indices[0]
+                fac_idx = int(face_to_facet[fi0])
+                unvisited.discard(fac_idx)
+            # Nếu vòng lặp không tiến (start vẫn còn) ⇒ skip để tránh loop vô hạn
+            if start in unvisited:
+                unvisited.discard(start)
             island_id += 1
 
         progress("Unfold xong!", 100)
-        result.panels     = all_panels
-        result.success    = True
+        result.panels      = all_panels
+        result.success     = True
         result.num_islands = island_id
+        result.num_facets  = len(facets)
 
     except Exception as e:
         result.error = str(e)
@@ -192,121 +498,3 @@ def unfold_mesh(mesh: trimesh.Trimesh,
         traceback.print_exc()
 
     return result
-
-
-import heapq
-
-def _angle_between_normals(n1, n2):
-    return np.arccos(np.clip(np.dot(n1, n2), -1.0, 1.0))
-
-def _unfold_island(mesh, start_face, neighbors, adj, adj_edges, island_id, unvisited):
-    """MST unfold (Prim's) ưu tiên mặt phẳng, trả về list Panel2D."""
-    panels: dict[int, Panel2D] = {}
-    placed_polys = []
-    
-    pq = []
-    heapq.heappush(pq, (0.0, start_face, -1, -1))
-    
-    island_visited = set()
-    
-    while pq:
-        cost, current, parent, ei_parent = heapq.heappop(pq)
-        
-        if current in island_visited:
-            continue
-            
-        if current not in unvisited and current not in panels:
-            continue
-            
-        if parent == -1:
-            v3d = mesh.triangles[current]
-            v2d = _tri_to_2d(*v3d)
-            panels[current] = Panel2D(
-                face_idx=current,
-                verts_2d=v2d,
-                group_id=island_id,
-            )
-            placed_polys.append(Polygon(v2d))
-            island_visited.add(current)
-        else:
-            parent_v2d = panels[parent].verts_2d
-            
-            shared_v_idx = adj_edges[ei_parent]
-            sv0, sv1 = int(shared_v_idx[0]), int(shared_v_idx[1])
-
-            # Đỉnh của parent
-            pf = mesh.faces[parent]
-            pi0 = int(np.where(pf == sv0)[0][0])
-            pi1 = int(np.where(pf == sv1)[0][0])
-            p2d_a = parent_v2d[pi0]
-            p2d_b = parent_v2d[pi1]
-
-            # Đỉnh của child
-            cf = mesh.faces[current]
-            ci0 = int(np.where(cf == sv0)[0][0])
-            ci1 = int(np.where(cf == sv1)[0][0])
-            
-            # Tạo tam giác 2D cục bộ giữ nguyên winding order của 3D
-            child_local = _tri_to_2d(
-                mesh.vertices[cf[0]], 
-                mesh.vertices[cf[1]], 
-                mesh.vertices[cf[2]]
-            )
-            
-            # Khớp cạnh (sv0, sv1) của child vào đúng vị trí (p2d_a, p2d_b) trên parent
-            # Vì 3D mesh là manifold, winding order ngược nhau sẽ tự động làm child gập RA NGOÀI
-            cl_a = child_local[ci0]
-            cl_b = child_local[ci1]
-            
-            R, t = _build_transform(cl_a, cl_b, p2d_a, p2d_b)
-            child_v2d = _apply_transform(child_local, R, t)
-
-            ordered = child_v2d
-            child_poly = Polygon(ordered)
-            
-            overlap = False
-            # Check overlap với tất cả các poly đã đặt
-            maxx1, maxy1 = ordered.max(axis=0)
-            minx1, miny1 = ordered.min(axis=0)
-            
-            # Sử dụng buffer âm để tránh bắt nhầm các cạnh chạm nhau
-            check_poly = child_poly.buffer(-1e-5)
-            if check_poly.is_empty: # Triangle quá mỏng, bỏ qua
-                check_poly = child_poly
-
-            for p in placed_polys:
-                minx2, miny2, maxx2, maxy2 = p.bounds
-                if not (maxx1 <= minx2 or minx1 >= maxx2 or maxy1 <= miny2 or miny1 >= maxy2):
-                    if check_poly.intersects(p):
-                        overlap = True
-                        break
-            
-            if overlap:
-                continue
-
-            placed_polys.append(child_poly)
-            p_edge_i = _get_edge_index(mesh.faces[parent], sv0, sv1)
-            c_edge_i = _get_edge_index(mesh.faces[current], sv0, sv1)
-            
-            panels[parent].fold_edges.add(p_edge_i)
-
-            panels[current] = Panel2D(
-                face_idx=current,
-                verts_2d=ordered,
-                group_id=island_id,
-            )
-            panels[current].fold_edges.add(c_edge_i)
-            island_visited.add(current)
-
-        # Enqueue neighbors
-        n1 = mesh.face_normals[current]
-        for child, ei in neighbors[current]:
-            if child in island_visited or child not in unvisited:
-                continue
-            n2 = mesh.face_normals[child]
-            angle = _angle_between_normals(n1, n2)
-            heapq.heappush(pq, (angle, child, current, ei))
-
-    return list(panels.values())
-
-

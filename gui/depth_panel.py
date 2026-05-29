@@ -47,9 +47,10 @@ class DepthWorker(QThread):
 
             self.progress_sig.emit(f"Depth OK! {depth_r.num_faces} faces", 62)
 
-            # Unfold
+            # Unfold (depth mesh có nhiều mặt cong → nới tol 25° để gom mạnh)
             self.progress_sig.emit("Unfold mesh...", 65)
             unfold_r = unfold_mesh(depth_r.mesh, max_faces=self.target_faces*2,
+                coplanar_tol_deg=25.0,
                 on_progress=lambda m,p: self.progress_sig.emit(m, 65+p//5))
             if not unfold_r.success:
                 self.error_sig.emit(unfold_r.error); return

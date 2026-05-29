@@ -6,19 +6,18 @@ Xuất layout papercraft ra file PDF đẹp bằng ReportLab.
 - Đánh số từng mảnh
 - Trang cuối: bảng hướng dẫn lắp ráp
 """
-import os
 import numpy as np
 from pathlib import Path
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas as rl_canvas
-from reportlab.lib.colors import HexColor, Color
+from reportlab.lib.colors import HexColor
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 import platform
 
-from modules.layout import LayoutResult, LayoutPanel, A4_W_MM, A4_H_MM
+from modules.layout import LayoutResult, A4_W_MM, A4_H_MM
 
 def _register_fonts():
     try:
@@ -59,13 +58,15 @@ def _pts(arr: np.ndarray):
     """Chuyển tọa độ mm → points cho ReportLab, lật trục Y (PDF gốc dưới trái)."""
     return [(x * mm, (A4_H_MM - y) * mm) for x, y in arr]
 
-def _draw_triangle(c: rl_canvas.Canvas, verts_mm: np.ndarray):
-    """Vẽ vùng màu trắng (không viền) cho tam giác."""
+def _draw_panel_fill(c: rl_canvas.Canvas, verts_mm: np.ndarray):
+    """Vẽ vùng nền trắng (không viền) cho 1 panel — hỗ trợ polygon n-gon."""
     pts = _pts(verts_mm)
+    if len(pts) < 3:
+        return
     p = c.beginPath()
     p.moveTo(*pts[0])
-    p.lineTo(*pts[1])
-    p.lineTo(*pts[2])
+    for px, py in pts[1:]:
+        p.lineTo(px, py)
     p.close()
     c.setFillColorRGB(1, 1, 1, 1.0)
     c.drawPath(p, fill=1, stroke=0)
@@ -161,6 +162,43 @@ def _draw_label(c: rl_canvas.Canvas, centroid_mm, text: str, fontsize=6):
     c.drawCentredString(x, y, text)
 
 
+def _draw_scale_ruler(c: rl_canvas.Canvas, x_mm: float, y_mm: float,
+                      length_mm: float = 100.0):
+    """Vẽ thước calibration để người dùng kiểm tra tỉ lệ in.
+
+    Một thước 100mm chia vạch mỗi 10mm. Sau khi in, dùng thước thật đo lại
+    đoạn này — nếu khác 100mm thì máy in đang scale sai (chỉnh 'Actual Size'
+    / 100% trong dialog in).
+    """
+    pts = _pts(np.array([[x_mm, y_mm], [x_mm + length_mm, y_mm]]))
+    c.setStrokeColor(CUT_COLOR)
+    c.setLineWidth(0.6)
+    c.setDash()
+    c.line(*pts[0], *pts[1])
+
+    # Vạch chia mỗi 10mm
+    for i in range(int(length_mm // 10) + 1):
+        tick_x = x_mm + i * 10
+        tick_h = 2.0 if i % 5 else 3.2   # vạch dài hơn ở 0, 50, 100mm
+        tp = _pts(np.array([[tick_x, y_mm], [tick_x, y_mm - tick_h]]))
+        c.line(*tp[0], *tp[1])
+
+    # Nhãn "0", "100mm"
+    c.setFillColor(LABEL_COLOR)
+    c.setFont(FONT_REGULAR, 5.5)
+    lbl0 = _pts([np.array([x_mm, y_mm + 1.2])])[0]
+    lbl_end = _pts([np.array([x_mm + length_mm, y_mm + 1.2])])[0]
+    c.drawString(lbl0[0] - 1*mm, lbl0[1], "0")
+    c.drawString(lbl_end[0] - 5*mm, lbl_end[1], f"{int(length_mm)}mm")
+
+    # Hint nhỏ
+    c.setFillColor(colors.gray)
+    c.setFont(FONT_REGULAR, 5)
+    hint = _pts([np.array([x_mm, y_mm - 6])])[0]
+    c.drawString(hint[0], hint[1],
+                 "Calibrate: đoạn này phải dài đúng 100mm khi in (in 'Actual Size / 100%').")
+
+
 # ── Page drawing ─────────────────────────────────────────────────────────────
 
 def _draw_page(c: rl_canvas.Canvas, layout_panels: list, page_num: int,
@@ -197,32 +235,38 @@ def _draw_page(c: rl_canvas.Canvas, layout_panels: list, page_num: int,
         c.rect(lx+85*mm, ly, 8*mm, 3*mm, fill=1, stroke=1)
         c.setFillColor(colors.black);  c.drawString(lx+94*mm, ly+0.8*mm, "Tab dán")
 
+        # Thước calibration 100mm (góc trên-phải, dưới header)
+        _draw_scale_ruler(c, x_mm=A4_W_MM - 110, y_mm=14, length_mm=100.0)
+
     # Vẽ các panel
     for lp in layout_panels:
         verts = lp.verts_placed  # mm
+        n_v = len(verts)
+        if n_v < 3:
+            continue
 
-        # Vẽ tam giác (chỉ tô nền trắng)
-        _draw_triangle(c, verts)
+        # Tô nền panel (polygon n-gon)
+        _draw_panel_fill(c, verts)
 
         # Vẽ đường cắt
         for ei in lp.cut_edges:
             v0 = verts[ei]
-            v1 = verts[(ei+1) % 3]
+            v1 = verts[(ei + 1) % n_v]
             _draw_cut_line(c, v0, v1)
 
         # Vẽ tab dán (bao gồm cả nét cắt viền và nét gấp)
         for ei, _ in lp.glue_edges:
             v0 = verts[ei]
-            v1 = verts[(ei+1) % 3]
+            v1 = verts[(ei + 1) % n_v]
             if show_glue:
                 _draw_glue_tab(c, v0, v1)
 
         # Vẽ đường gấp
         for ei in lp.fold_edges:
             v0 = verts[ei]
-            v1 = verts[(ei+1) % 3]
+            v1 = verts[(ei + 1) % n_v]
             _draw_fold_line(c, v0, v1)
-            
+
         # flat_edges thì KHÔNG VẼ GÌ (tự động giấu nét)
 
     # Footer
@@ -251,7 +295,7 @@ def _draw_assembly_guide(c: rl_canvas.Canvas, total_panels: int):
         ("3. Gấp",
          "Gấp theo đường xanh đứt. Gấp vào (mountain fold) — phần màu nằm bên ngoài."),
         ("4. Dán",
-         "Dán tab xám vào mặt bên trong của mảnh kế tiếp. Số trên tab = số mảnh cần ghép."),
+         "Dán tab (có dấu 'x') vào mặt bên trong của mảnh liền kề. Dấu 'x' chỉ phần keo bôi."),
         ("5. Lắp ráp",
          "Bắt đầu từ mảnh số 1, lần lượt ghép các mảnh liền kề. Dùng kẹp giấy để giữ trong khi keo khô."),
         ("6. Hoàn thiện",

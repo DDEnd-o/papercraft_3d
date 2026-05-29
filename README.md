@@ -1,96 +1,175 @@
 # 🎨 Papercraft 3D App
 
-**Papercraft 3D** là một ứng dụng máy tính (Desktop App) giúp người dùng tự động chuyển đổi các mô hình 3D (Object/STL) hoặc thậm chí là hình ảnh 2D thông thường thành các bản vẽ thiết kế cắt dán giấy (Papercraft) có thể in ra dưới định dạng PDF.
+**Papercraft 3D** là ứng dụng máy tính giúp tự động chuyển đổi mô hình 3D (OBJ/STL/GLB/PLY) hoặc ảnh 2D thành bản vẽ cắt dán giấy (papercraft) xuất ra PDF khổ A4.
 
 ---
 
-## ✨ Tính Năng Nổi Bật
+## ✨ Tính năng
 
-1. **Nhập Mô Hình Đa Dạng**: 
-   - Hỗ trợ nhập các file 3D tiêu chuẩn như `.obj`, `.stl`, `.glb`, `.ply`, v.v.
-   - Cung cấp sẵn các khối hình học cơ bản (Primitives) như Khối lập phương, Hình cầu, Hình trụ,...
-2. **AI Image-to-Papercraft (Từ Ảnh sang Papercraft)**: 
-   - Tích hợp mô hình AI **Depth Anything V2** (HuggingFace) để phân tích chiều sâu của một bức ảnh 2D bất kỳ, tái tạo thành mô hình 3D và tự động trải phẳng.
-3. **Thuật Toán Unfold & Layout Tự Động**: 
-   - Trải phẳng bề mặt 3D (Unfold) thành các mảnh 2D tối ưu, giảm thiểu sự rời rạc.
-   - Sắp xếp các mảnh ghép (Layout) lên kích thước giấy A4 một cách tiết kiệm không gian nhất.
-4. **Trực Quan & Dễ Sử Dụng**: 
-   - Giao diện đồ họa (GUI) hiện đại, trực quan được xây dựng bằng PyQt5.
-   - Xem trước (Preview) bản vẽ 2D trực tiếp trên màn hình trước khi xuất file.
-5. **Xuất Bản Vẽ PDF Chuyên Nghiệp**: 
-   - Xuất file định dạng PDF chuẩn kích thước A4.
-   - Tự động đánh số thứ tự (ID) các mặt và vẽ sẵn mép dán (Glue tabs), đường gập (Fold lines).
+### 1. Nhập mô hình đa dạng
+- File 3D tiêu chuẩn: `.obj`, `.stl`, `.glb`, `.gltf`, `.ply`, `.off`
+- 8 primitive shapes: Cube, Sphere, Cylinder, Cone, Torus, Tetrahedron, Capsule, Annulus
+- **AI từ ảnh** (Depth Anything V2): 1 ảnh 2D → mesh 3D → papercraft
+
+### 2. Thuật toán Unfold & Layout (v1.2)
+- **Gộp đồng phẳng** trước khi unfold: cube 12 tri → 6 quad, giảm số mảnh đáng kể
+- **MST/BFS unfold** trên facet graph với overlap check toàn cục
+- **FFDH packing** (First-Fit Decreasing Height) cho A4
+- Retry với gap nới rộng nếu phát hiện chồng nhau giữa các island
+
+### 3. AI Pipeline cho ảnh đơn (v1.3)
+- **Solidify mesh**: front layer + back layer (z=0) + side walls → khối kín watertight
+- **Coplanar tolerance 25°** cho mặt cong (depth mesh) — gom ít mảnh hơn
+- **Cảnh báo chất lượng**: popup nếu mesh không phù hợp papercraft (>60 panels hoặc >5 islands)
+
+### 4. AI back view (v1.4 — experimental)
+- **Stable Diffusion inpainting** sinh ảnh mặt sau từ ảnh mặt trước
+- Depth lần 2 trên ảnh back → mesh có khối ở cả 2 mặt
+- ⚠️ Kết quả không đảm bảo đúng (AI có thể hallucinate mặt trước lần 2)
+
+### 5. Multi-view reconstruction (v1.5 — experimental)
+- **4 ảnh** (front/back/left/right) → 4 depth maps → Poisson reconstruction → mesh 3D thật
+- **CLIP validation** kiểm tra 4 ảnh có cùng object không (threshold cosine sim 0.75)
+- Silhouette-only mode (use_depth=False) robust hơn khi depth không scale-aligned
+
+### 6. Xuất PDF chuyên nghiệp
+- Khổ A4, đường cắt (đen), đường gấp (xanh đứt), tab dán (xám có dấu 'x')
+- Đánh số mảnh, calibration ruler 100mm, trang hướng dẫn lắp ráp
 
 ---
 
-## 📂 Cấu Trúc Dự Án
+## 📂 Cấu trúc dự án
 
 ```text
 papercraft_app/
 │
-├── main.py                    # File khởi chạy chính của ứng dụng
-├── requirements.txt           # Danh sách các thư viện Python cần thiết
+├── main.py                       # Entry point: GUI hoặc CLI
+├── requirements.txt              # Python dependencies
+├── README.md                     # File này
+├── V14_README.md                 # Notes cho v1.4 (AI back view)
+├── V15_DESIGN.md                 # Design doc cho v1.5 (multi-view)
 │
-├── gui/                       # Thư mục chứa giao diện người dùng (Frontend)
-│   ├── main_window.py         # Cửa sổ ứng dụng chính (Sidebar, Viewport, Tabs)
-│   └── depth_panel.py         # Giao diện cho tính năng AI (Từ Ảnh -> Papercraft)
+├── gui/
+│   ├── main_window.py            # Cửa sổ chính (sidebar + preview + tabs)
+│   └── depth_panel.py            # Tab "Từ Ảnh (AI)"
 │
-├── modules/                   # Thư mục chứa logic lõi (Backend Pipeline)
-│   ├── mesh_loader.py         # Xử lý đọc file 3D và tạo các khối cơ bản
-│   ├── depth_estimator.py     # Xử lý AI ước lượng chiều sâu từ ảnh 2D
-│   ├── unfolder.py            # Thuật toán trải phẳng (Unfold) lưới 3D thành 2D
-│   ├── layout.py              # Thuật toán sắp xếp (Pack) các panel 2D lên giấy A4
-│   └── pdf_exporter.py        # Xuất dữ liệu đồ họa 2D ra file PDF (ReportLab)
+├── modules/
+│   ├── mesh_loader.py            # Load file 3D + tạo primitive
+│   ├── unfolder.py               # MST unfold + coplanar facet merging (v1.2)
+│   ├── layout.py                 # FFDH packing + overlap validation
+│   ├── pdf_exporter.py           # Xuất PDF (ReportLab) với n-gon panels
+│   ├── depth_estimator.py        # Depth Anything V2 + solidify mesh (v1.3+)
+│   ├── back_view_generator.py    # v1.4: SD inpainting sinh ảnh mặt sau
+│   ├── multiview_reconstructor.py # v1.5: Poisson từ 4 depth maps
+│   └── image_validator.py        # v1.5: CLIP check 4 ảnh cùng object
 │
-└── output/                    # (Thư mục) Mặc định lưu các file PDF xuất ra
+├── tests/
+│   ├── test_pipeline.py          # 14 pytest (8 primitives + STL + cube quad check)
+│   ├── conftest.py
+│   └── fixtures/
+│       ├── generate_sample_stl.py
+│       └── sample_house.stl
+│
+├── scripts/                      # Demo & test scripts
+│   ├── test_duck.py              # v1.3 trên duck-toy.png
+│   ├── test_duck_v14.py          # v1.4 SD inpainting
+│   ├── test_duck_multiview.py    # v1.5 multi-view
+│   └── generate_multiview_images.py  # Render 4 views từ duck mesh
+│
+├── img/
+│   ├── duck-toy.png              # Ảnh sample cho v1.3/v1.4
+│   └── multiview_duck/           # 4 ảnh render cho v1.5
+│
+└── output/                       # PDF + intermediate files
 ```
 
 ---
 
-## 🚀 Hướng Dẫn Cài Đặt & Chạy
+## 🚀 Cài đặt & Chạy
 
-### 1. Yêu Cầu Hệ Thống
-- Python 3.10 trở lên.
-- Có kết nối Internet (để tải model AI ở lần chạy đầu tiên nếu dùng tính năng xử lý từ ảnh).
-- (Khuyến nghị) Card đồ họa rời nếu muốn xử lý AI Depth (model Large) nhanh hơn.
+### 1. Yêu cầu hệ thống
+- Python 3.10+
+- Internet (để tải AI model lần đầu)
+- **Torch ≥ 2.6** nếu dùng v1.4 (SD inpainting) — bắt buộc do CVE-2025-32434
+- (Khuyến nghị) GPU NVIDIA 4GB+ cho v1.4 (SD trên CPU mất ~5 phút/ảnh)
 
-### 2. Cài Đặt Thư Viện
-
-Mở terminal/command prompt tại thư mục dự án và chạy lệnh sau để cài đặt các thư viện cơ bản:
+### 2. Cài đặt thư viện
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Nếu bạn muốn sử dụng tính năng **Từ Ảnh (AI)**, bạn cần cài đặt thêm các thư viện xử lý máy học (Deep Learning):
+`requirements.txt` đã bao gồm tất cả: trimesh, numpy, scipy, Pillow, reportlab, PyQt5, shapely, pytest, diffusers, accelerate, safetensors, open3d.
+
+Nếu cần dùng tính năng AI (depth/SD/CLIP), cài thêm:
 
 ```bash
-pip install transformers torch torchvision opencv-python open3d
+pip install transformers torch torchvision opencv-python
 ```
-*(Nếu bạn có GPU NVIDIA, hãy cài đặt `torch` bản có CUDA để tăng tốc AI).*
 
-### 3. Khởi Chạy Ứng Dụng
+*(Có GPU NVIDIA, cài torch bản CUDA: `pip install torch --index-url https://download.pytorch.org/whl/cu121`)*
 
-Chạy lệnh sau tại thư mục dự án:
+### 3. Chạy
 
+**GUI:**
 ```bash
 python main.py
 ```
 
+**CLI** (primitive):
+```bash
+python main.py --shape cube --faces 120 --output output/cube.pdf
+```
+
+**CLI** (file 3D):
+```bash
+python main.py --file model.stl --faces 200 --size 65
+```
+
+## 🛠 Hướng dẫn sử dụng
+
+### GUI cơ bản
+1. Chọn nguồn ở sidebar trái:
+   - **Primitive Shape** (cube/sphere/cylinder/...) — khuyến nghị cho người mới
+   - **Import file .obj/.stl** — nếu có sẵn model 3D khối kín
+   - **Tab 📷 Từ Ảnh (AI)** — sinh papercraft từ 1 ảnh 2D
+2. Điều chỉnh **Số mặt** (20-800) và **Kích thước panel** (20-150mm)
+3. Bấm **▶ Tạo Papercraft**, đợi xử lý (~10-30s)
+4. Xem preview ở giữa, bấm **⬇ Xuất PDF**
+
+### Scripts experimental
+
+```bash
+# v1.3 — duck từ 1 ảnh, mặt sau phẳng (phù điêu)
+python scripts/test_duck.py
+
+# v1.4 — duck với AI back view (cần torch ≥ 2.6, chậm)
+python scripts/test_duck_v14.py
+
+# v1.5 — duck từ 4 ảnh multi-view (chất lượng cao nhất)
+python scripts/generate_multiview_images.py    # tạo 4 ảnh trước
+python scripts/test_duck_multiview.py          # rồi chạy pipeline
+```
+
 ---
 
-## 🛠 Hướng Dẫn Sử Dụng Cơ Bản
+## 📊 So sánh các version (test với duck)
 
-1. Mở ứng dụng.
-2. Chọn nguồn đầu vào ở thanh Sidebar bên trái:
-   - **Primitive Shape / Import file .obj/.stl**: Nếu bạn đã có mô hình 3D.
-   - **Tab 📷 Từ Ảnh (AI)**: Nếu bạn chỉ có một bức ảnh 2D.
-3. Điều chỉnh **Cài Đặt**:
-   - *Số mặt (faces)*: Độ chi tiết của mô hình (càng cao càng đẹp nhưng cắt dán càng lâu).
-   - *Kích thước panel (mm)*: Kích thước mong muốn của mảnh giấy.
-4. Bấm **▶ Tạo Papercraft** và đợi ứng dụng xử lý.
-5. Xem trước bản vẽ ở phần giữa màn hình. Bấm **⬇ Xuất PDF** để lưu file đi in.
+| Version | Input | Panels | Islands | Watertight | Use case |
+|---|---|---|---|---|---|
+| **v1.2** | Primitives/STL khối kín | 6 (cube) / ≥7 (house) | 1-3 | ✅ True | **Production tốt nhất** |
+| **v1.3** | 1 ảnh đơn | 33 | 3 | ✅ True | Phù điêu (mặt sau phẳng) |
+| v1.4 | 1 ảnh + AI back | 17 | 6 | ❌ False | Demo AI (kết quả khó đoán) |
+| **v1.5** | 4 ảnh thật | 63 | 10 | ⚠️ Euler=0 | Khối 3D thật (cần 4 ảnh chuẩn) |
 
 ---
 
-**Chúc bạn có những mô hình thủ công bằng giấy (Papercraft) tuyệt vời! ✂️📜**
+## ⚠️ Lưu ý
+
+- **Calibration**: trang đầu PDF có thước 100mm — sau khi in, đo lại đoạn này. Nếu không bằng 100mm, chỉnh máy in về "Actual Size / 100%".
+- **Giấy**: dùng giấy 120-160gsm cho cứng cáp. Giấy thường (80gsm) sẽ mềm.
+- **AI features**: lần đầu chạy sẽ tải model (~100MB cho depth, ~4GB cho SD inpainting). Lưu trong cache HuggingFace.
+
+---
+
+**Chúc bạn có những mô hình thủ công bằng giấy tuyệt vời! ✂️📜**

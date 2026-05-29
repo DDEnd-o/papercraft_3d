@@ -4,8 +4,16 @@ Chạy GUI : python main.py
 Chạy CLI : python main.py --shape cube --faces 120 --output output/cube.pdf
 """
 import sys
+import io
 import argparse
 from pathlib import Path
+
+# Ép stdout/stderr sang UTF-8 để emoji (✅, ❌, ▶, ...) không crash trên Windows cp1252
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 

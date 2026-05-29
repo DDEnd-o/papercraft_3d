@@ -239,11 +239,14 @@ class PapercraftView(QWidget):
         painter.drawRoundedRect(int(off_x), int(off_y),
                                 int(a4_w_px), int(a4_h_px), 4, 4)
 
-        # Vẽ từng panel
+        # Vẽ từng panel (polygon n-gon sau v1.2)
         import colorsys
         for lp in page_panels:
             verts_mm = lp.verts_placed
-            # Màu theo face index
+            n_v = len(verts_mm)
+            if n_v < 3:
+                continue
+
             h_val = (lp.panel.face_idx * 47) % 360 / 360.0
             r, g, b = colorsys.hls_to_rgb(h_val, 0.72, 0.55)
 
@@ -258,16 +261,16 @@ class PapercraftView(QWidget):
             painter.setPen(QPen(QColor("#333333"), 0.8))
             painter.drawPolygon(pts)
 
-            # Fold lines
+            # Fold lines (n-gon)
             painter.setPen(QPen(QColor("#1565C0"), 0.7, Qt.DashLine))
             for ei in lp.fold_edges:
                 p0 = pts[ei]
-                p1 = pts[(ei+1) % 3]
+                p1 = pts[(ei + 1) % n_v]
                 painter.drawLine(p0, p1)
 
-            # Label
-            cx = sum(p.x() for p in pts) / 3
-            cy = sum(p.y() for p in pts) / 3
+            # Label tại centroid
+            cx = sum(p.x() for p in pts) / n_v
+            cy = sum(p.y() for p in pts) / n_v
             painter.setPen(QPen(QColor("#222222")))
             painter.setFont(QFont("Arial", max(5, int(7*self.zoom))))
             painter.drawText(int(cx-8), int(cy+4), lp.label)
@@ -561,7 +564,47 @@ class MainWindow(QMainWindow):
         self.btn_pdf.setEnabled(True)
         self.btn_run.setEnabled(True)
         self.progress.setVisible(False)
+
+        # Cảnh báo chất lượng papercraft (v1.3)
+        self._check_papercraft_quality(unfold_r, layout_r)
+
         self._log("✅ Hoàn tất! Nhấn 'Xuất PDF' để lưu file.", "#4ECB71")
+
+    def _check_papercraft_quality(self, unfold_r, layout_r):
+        """Cảnh báo người dùng nếu mesh không phù hợp papercraft."""
+        n_panels  = len(unfold_r.panels)
+        n_islands = unfold_r.num_islands
+        warnings = []
+        if n_panels > 60:
+            warnings.append(
+                f"Quá nhiều mảnh ({n_panels}). Mesh phù hợp papercraft nên có ≤60 mảnh — "
+                "thử Primitive (cube/sphere) hoặc STL khối kín với ít mặt cong hơn."
+            )
+        elif n_panels > 30:
+            warnings.append(
+                f"Hơi nhiều mảnh ({n_panels}) — cắt/dán sẽ tỉ mỉ."
+            )
+        if n_islands > 5:
+            warnings.append(
+                f"Quá nhiều island rời ({n_islands}). Lắp ráp sẽ khó vì các mảnh không liền nhau — "
+                "thường do mesh cong hoặc bị overlap khi unfold."
+            )
+        elif n_islands > 2:
+            warnings.append(
+                f"Có {n_islands} island riêng biệt — lưu ý khi lắp ráp."
+            )
+        if layout_r.warnings:
+            warnings.extend(layout_r.warnings)
+
+        if not warnings:
+            return
+
+        for w in warnings:
+            self._log(f"⚠️ {w}", "#F5C518")
+        QMessageBox.warning(
+            self, "Lưu ý chất lượng",
+            "Mesh có thể không lý tưởng cho papercraft:\n\n• " + "\n• ".join(warnings)
+        )
 
     def _on_error(self, msg):
         self.btn_run.setEnabled(True)
