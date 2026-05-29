@@ -13,6 +13,26 @@ from pathlib import Path
 import numpy as np
 
 
+def _info_label(text: str, tooltip: str) -> QWidget:
+    """Label kèm icon ⓘ — hover vào icon để xem chú thích chi tiết."""
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(4)
+    lbl = QLabel(text)
+    h.addWidget(lbl)
+    info = QLabel("ⓘ")
+    info.setStyleSheet(
+        "color:#7A7AA0; font-size:13px; padding:0 4px;"
+        "background: transparent; border: none;"
+    )
+    info.setCursor(Qt.WhatsThisCursor)
+    info.setToolTip(tooltip)
+    h.addWidget(info)
+    h.addStretch()
+    return w
+
+
 class DepthWorker(QThread):
     progress_sig = pyqtSignal(str, int)
     done_sig     = pyqtSignal(object, object, object)   # depth_r, unfold_r, layout_r
@@ -127,21 +147,42 @@ class DepthPanel(QWidget):
         grp_cfg = QGroupBox("Cài đặt AI")
         cfg_l   = QVBoxLayout(grp_cfg)
 
-        cfg_l.addWidget(QLabel("Model size:"))
+        cfg_l.addWidget(_info_label(
+            "Model size:",
+            "Chọn model Depth Anything V2 để dự đoán độ sâu (depth map) từ ảnh 2D.\n\n"
+            "• Small (~100MB): nhanh nhất, chạy CPU OK, depth thô — phù hợp test/preview.\n"
+            "• Base  (~400MB): cân bằng tốc độ & chất lượng, khuyến nghị GPU.\n"
+            "• Large (~1.3GB): chất lượng cao nhất, depth mịn, cần GPU 4GB+ RAM.\n\n"
+            "Lần đầu chọn model nào sẽ tải về máy ~ 1 lần (cache HuggingFace)."
+        ))
         self.combo_model = QComboBox()
         self.combo_model.addItem("🚀 Small (~100MB) — CPU OK", "small")
         self.combo_model.addItem("⚡ Base  (~400MB) — GPU tốt hơn", "base")
         self.combo_model.addItem("🎯 Large (~1.3GB) — GPU 4GB+", "large")
         cfg_l.addWidget(self.combo_model)
 
-        cfg_l.addWidget(QLabel("Số faces mục tiêu:"))
+        cfg_l.addWidget(_info_label(
+            "Số faces mục tiêu:",
+            "Số tam giác tối đa của mesh 3D dựng từ depth map (sau khi simplify).\n\n"
+            "• 50–100: mesh thô, ít panel, phù điêu đơn giản.\n"
+            "• 150–300: cân bằng giữa chi tiết và độ phức tạp khi cắt dán.\n"
+            "• 400–800: chi tiết mịn nhưng papercraft sẽ rất nhiều mảnh, khó lắp.\n\n"
+            "Pipeline v1.3: mesh sẽ được solidify (front + back + side walls) để watertight."
+        ))
         self.spin_faces = QSpinBox()
         self.spin_faces.setRange(50, 800)
         self.spin_faces.setValue(150)
         self.spin_faces.setSingleStep(25)
         cfg_l.addWidget(self.spin_faces)
 
-        cfg_l.addWidget(QLabel("Kích thước panel (mm):"))
+        cfg_l.addWidget(_info_label(
+            "Kích thước panel (mm):",
+            "Kích thước mục tiêu (mm) của mảnh giấy lớn nhất khi in lên A4.\n\n"
+            "• 20–40 mm: nhiều mảnh nhỏ trên 1 trang.\n"
+            "• 50–80 mm: kích thước phổ biến, dễ cắt dán bằng tay.\n"
+            "• 90–120 mm: mảnh lớn, mô hình thành phẩm to.\n\n"
+            "Tất cả mảnh được scale đồng đều theo mảnh lớn nhất → giữ đúng tỉ lệ."
+        ))
         self.spin_size = QSpinBox()
         self.spin_size.setRange(20, 120)
         self.spin_size.setValue(60)

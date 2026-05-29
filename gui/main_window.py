@@ -118,6 +118,29 @@ QCheckBox::indicator:checked { background: #F5C518; border-color: #F5C518; }
 """
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _info_label(text: str, tooltip: str) -> QWidget:
+    """Tạo label có icon ⓘ ở cuối — hover/click vào icon để xem giải thích chi tiết."""
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(4)
+
+    lbl = QLabel(text)
+    h.addWidget(lbl)
+
+    info = QLabel("ⓘ")
+    info.setStyleSheet(
+        "color:#7A7AA0; font-size:13px; padding:0 4px;"
+        "background: transparent; border: none;"
+    )
+    info.setCursor(Qt.WhatsThisCursor)
+    info.setToolTip(tooltip)
+    h.addWidget(info)
+    h.addStretch()
+    return w
+
+
 # ── Worker thread ─────────────────────────────────────────────────────────────
 class PipelineWorker(QThread):
     progress_sig = pyqtSignal(str, int)
@@ -374,14 +397,29 @@ class MainWindow(QMainWindow):
         grp_set = QGroupBox("Cài Đặt")
         grp_set_l = QVBoxLayout(grp_set)
 
-        grp_set_l.addWidget(QLabel("Số mặt (faces):"))
+        grp_set_l.addWidget(_info_label(
+            "Số mặt (faces):",
+            "Số lượng tam giác (faces) của mesh sau khi tải/giảm.\n\n"
+            "• Thấp (20–80): mô hình thô, ít mảnh giấy, dễ cắt dán.\n"
+            "• Trung bình (100–250): cân bằng giữa chi tiết và độ phức tạp.\n"
+            "• Cao (300–800): chi tiết mịn nhưng rất nhiều mảnh — khó lắp.\n\n"
+            "Lưu ý: với primitive (cube/sphere), số này quyết định mức tessellation. "
+            "Sau khi gộp đồng phẳng (v1.2), số panel thực tế sẽ nhỏ hơn (vd cube 12 tri → 6 quad)."
+        ))
         self.spin_faces = QSpinBox()
         self.spin_faces.setRange(20, 800)
         self.spin_faces.setValue(120)
         self.spin_faces.setSingleStep(20)
         grp_set_l.addWidget(self.spin_faces)
 
-        grp_set_l.addWidget(QLabel("Kích thước panel (mm):"))
+        grp_set_l.addWidget(_info_label(
+            "Kích thước panel (mm):",
+            "Kích thước mục tiêu (mm) của mảnh giấy lớn nhất khi in lên A4.\n\n"
+            "• 20–40 mm: nhiều mảnh nhỏ trên 1 trang, in tiết kiệm giấy.\n"
+            "• 50–80 mm: kích thước phổ biến, dễ cắt dán bằng tay.\n"
+            "• 100–150 mm: mảnh lớn, mô hình thành phẩm to.\n\n"
+            "Toàn bộ mảnh sẽ được scale đồng đều theo mảnh lớn nhất → giữ đúng tỉ lệ giữa các mặt."
+        ))
         self.spin_size = QSpinBox()
         self.spin_size.setRange(20, 150)
         self.spin_size.setValue(65)
@@ -389,6 +427,11 @@ class MainWindow(QMainWindow):
 
         self.chk_glue = QCheckBox("Hiển thị tab dán")
         self.chk_glue.setChecked(True)
+        self.chk_glue.setToolTip(
+            "Bật/tắt việc vẽ tab dán (mép xám có dấu 'x') ở mỗi cạnh ngoài của panel.\n\n"
+            "• Bật: PDF có tab dán → dán keo lên đó để ráp các mảnh.\n"
+            "• Tắt: panel chỉ có đường cắt — phù hợp khi bạn muốn dán nối kiểu khác (băng dính sau lưng)."
+        )
         grp_set_l.addWidget(self.chk_glue)
 
         sb_layout.addWidget(grp_set)
@@ -453,13 +496,19 @@ class MainWindow(QMainWindow):
         self.preview = PapercraftView()
         self.tabs.addTab(self.preview, "📄 Papercraft Preview")
 
-        # Tab 2: Từ ảnh (Nhánh 1)
+        # Tab 2: Từ 1 ảnh (v1.3 — Depth Anything)
         from gui.depth_panel import DepthPanel
         self.depth_panel = DepthPanel()
         self.depth_panel.layout_ready.connect(self._on_depth_layout_ready)
-        self.tabs.addTab(self.depth_panel, "📷 Từ Ảnh (AI)")
+        self.tabs.addTab(self.depth_panel, "📷 Từ 1 Ảnh (AI)")
 
-        # Tab 3: Info
+        # Tab 3: Từ 4 ảnh (v1.5 — Multi-view Poisson)
+        from gui.multiview_panel import MultiViewPanel
+        self.multiview_panel = MultiViewPanel()
+        self.multiview_panel.layout_ready.connect(self._on_depth_layout_ready)
+        self.tabs.addTab(self.multiview_panel, "📷📷 Từ 4 Ảnh (Multi-view)")
+
+        # Tab 4: Info
         self.info_widget = QTextEdit()
         self.info_widget.setReadOnly(True)
         self.info_widget.setPlaceholderText("Thông tin mesh và kết quả sẽ hiển thị ở đây...")
