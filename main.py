@@ -79,6 +79,14 @@ def run_cli(args):
 
 
 if __name__ == "__main__":
+    # --- WORKAROUND cho WinError 1114 (PyTorch + PyQt5 trên Windows) ---
+    # Import torch ở main thread TRƯỚC khi PyQt5 khởi tạo để tránh lỗi DLL init
+    try:
+        import torch
+    except ImportError:
+        pass
+    # ------------------------------------------------------------------
+
     parser = argparse.ArgumentParser(description="Papercraft 3D")
     parser.add_argument("--gui",    action="store_true")
     parser.add_argument("--shape",  default="cube",
