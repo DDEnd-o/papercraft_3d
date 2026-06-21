@@ -31,6 +31,7 @@
 - **4 ảnh** (front/back/left/right) → 4 depth maps → Poisson reconstruction → mesh 3D thật
 - **CLIP validation** kiểm tra 4 ảnh có cùng object không (threshold cosine sim 0.75)
 - Silhouette-only mode (use_depth=False) robust hơn khi depth không scale-aligned
+- Panel GUI riêng: **Tab 🔄 Multi-View** (`gui/multiview_panel.py`)
 
 ### 6. Xuất PDF chuyên nghiệp
 - Khổ A4, đường cắt (đen), đường gấp (xanh đứt), tab dán (xám có dấu 'x')
@@ -46,15 +47,16 @@ papercraft_app/
 ├── main.py                       # Entry point: GUI hoặc CLI
 ├── requirements.txt              # Python dependencies
 ├── README.md                     # File này
-├── V14_README.md                 # Notes cho v1.4 (AI back view)
-├── V15_DESIGN.md                 # Design doc cho v1.5 (multi-view)
 │
 ├── gui/
+│   ├── __init__.py
 │   ├── main_window.py            # Cửa sổ chính (sidebar + preview + tabs)
-│   └── depth_panel.py            # Tab "Từ Ảnh (AI)"
+│   ├── depth_panel.py            # Tab "📷 Từ Ảnh (AI)" — single-image pipeline
+│   └── multiview_panel.py        # Tab "🔄 Multi-View" — 4-image reconstruction
 │
 ├── modules/
-│   ├── mesh_loader.py            # Load file 3D + tạo primitive
+│   ├── __init__.py
+│   ├── mesh_loader.py            # Load file 3D + tạo primitive shapes
 │   ├── unfolder.py               # MST unfold + coplanar facet merging (v1.2)
 │   ├── layout.py                 # FFDH packing + overlap validation
 │   ├── pdf_exporter.py           # Xuất PDF (ReportLab) với n-gon panels
@@ -63,24 +65,15 @@ papercraft_app/
 │   ├── multiview_reconstructor.py # v1.5: Poisson từ 4 depth maps
 │   └── image_validator.py        # v1.5: CLIP check 4 ảnh cùng object
 │
-├── tests/
-│   ├── test_pipeline.py          # 14 pytest (8 primitives + STL + cube quad check)
-│   ├── conftest.py
-│   └── fixtures/
-│       ├── generate_sample_stl.py
-│       └── sample_house.stl
-│
-├── scripts/                      # Demo & test scripts
-│   ├── test_duck.py              # v1.3 trên duck-toy.png
-│   ├── test_duck_v14.py          # v1.4 SD inpainting
-│   ├── test_duck_multiview.py    # v1.5 multi-view
-│   └── generate_multiview_images.py  # Render 4 views từ duck mesh
-│
 ├── img/
-│   ├── duck-toy.png              # Ảnh sample cho v1.3/v1.4
-│   └── multiview_duck/           # 4 ảnh render cho v1.5
+│   ├── Sting-Sword-lowpoly.obj   # Sample model 3D (lowpoly sword)
+│   └── duck-img/                 # 4 ảnh multi-view sample (duck)
+│       ├── duck-1.jpg            # Front view
+│       ├── duck-2.jpg            # Back view
+│       ├── duck-3.jpg            # Left view
+│       └── duck-4.jpg            # Right view
 │
-└── output/                       # PDF + intermediate files
+└── output/                       # PDF & intermediate files (được tạo lúc chạy)
 ```
 
 ---
@@ -99,7 +92,7 @@ papercraft_app/
 pip install -r requirements.txt
 ```
 
-`requirements.txt` đã bao gồm tất cả: trimesh, numpy, scipy, Pillow, reportlab, PyQt5, shapely, pytest, diffusers, accelerate, safetensors, open3d.
+`requirements.txt` đã bao gồm tất cả: trimesh, numpy, scipy, Pillow, reportlab, PyQt5, fast-simplification, shapely, pytest, diffusers, accelerate, safetensors, open3d.
 
 Nếu cần dùng tính năng AI (depth/SD/CLIP), cài thêm:
 
@@ -114,6 +107,8 @@ pip install transformers torch torchvision opencv-python
 **GUI:**
 ```bash
 python main.py
+# hoặc
+python main.py --gui
 ```
 
 **CLI** (primitive):
@@ -126,6 +121,18 @@ python main.py --shape cube --faces 120 --output output/cube.pdf
 python main.py --file model.stl --faces 200 --size 65
 ```
 
+> **Các argument CLI:**
+> | Argument | Mô tả | Mặc định |
+> |---|---|---|
+> | `--gui` | Bắt buộc mở GUI | — |
+> | `--shape` | Primitive shape (cube/sphere/cylinder/cone/torus/tetrahedron/capsule/annulus) | `cube` |
+> | `--file` | Đường dẫn file 3D (.obj/.stl/...) | — |
+> | `--faces` | Số lượng mặt tối đa | `120` |
+> | `--size` | Kích thước panel (mm) | `65` |
+> | `--output` | Đường dẫn file PDF xuất ra | `output/<name>.pdf` |
+
+---
+
 ## 🛠 Hướng dẫn sử dụng
 
 ### GUI cơ bản
@@ -133,23 +140,20 @@ python main.py --file model.stl --faces 200 --size 65
    - **Primitive Shape** (cube/sphere/cylinder/...) — khuyến nghị cho người mới
    - **Import file .obj/.stl** — nếu có sẵn model 3D khối kín
    - **Tab 📷 Từ Ảnh (AI)** — sinh papercraft từ 1 ảnh 2D
+   - **Tab 🔄 Multi-View** — dùng 4 ảnh (front/back/left/right) để tái tạo mesh 3D
 2. Điều chỉnh **Số mặt** (20-800) và **Kích thước panel** (20-150mm)
 3. Bấm **▶ Tạo Papercraft**, đợi xử lý (~10-30s)
 4. Xem preview ở giữa, bấm **⬇ Xuất PDF**
 
-### Scripts experimental
+### Dữ liệu mẫu đi kèm
 
-```bash
-# v1.3 — duck từ 1 ảnh, mặt sau phẳng (phù điêu)
-python scripts/test_duck.py
-
-# v1.4 — duck với AI back view (cần torch ≥ 2.6, chậm)
-python scripts/test_duck_v14.py
-
-# v1.5 — duck từ 4 ảnh multi-view (chất lượng cao nhất)
-python scripts/generate_multiview_images.py    # tạo 4 ảnh trước
-python scripts/test_duck_multiview.py          # rồi chạy pipeline
-```
+| File | Mô tả | Dùng với |
+|---|---|---|
+| `img/Sting-Sword-lowpoly.obj` | Model 3D kiếm lowpoly | Import file 3D |
+| `img/duck-img/duck-1.jpg` | Duck — góc nhìn trước | Tab Multi-View |
+| `img/duck-img/duck-2.jpg` | Duck — góc nhìn sau | Tab Multi-View |
+| `img/duck-img/duck-3.jpg` | Duck — góc nhìn trái | Tab Multi-View |
+| `img/duck-img/duck-4.jpg` | Duck — góc nhìn phải | Tab Multi-View |
 
 ---
 
